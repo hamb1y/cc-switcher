@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Named Claude Code configuration directories. Credentials stay managed by Claude."""
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+
+VERSION = '0.1.0'
+os.umask(0o077)
+
+
+def checked(path):
+    path = Path(os.path.abspath(path))
+    if any(p.is_symlink() for p in (path, *path.parents)):
+        raise ValueError('symlink paths are not supported')
+    return path
+
+
+def private(path):
+    path = checked(path)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.stat().st_uid != os.getuid():
+        raise ValueError('profile directories must belong to the current user')
+    path.chmod(0o700)
+    return path
+
+
+def ident(value):
+    if not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,79}', value):
+        raise ValueError('invalid profile ID')
+    return value
+
+
+def label_id(label):
+    if not 1 <= len(label) <= 80 or any(ord(c) < 32 or ord(c) == 127 for c in label):
+        raise ValueError('label must contain 1-80 printable characters')
+    return ident(re.sub(r'[^a-z0-9._-]+', '-', label.lower()).strip('-'))
+
+
+def atomic(path, value):
+    path = checked(path)
+    fd, tmp = tempfile.mkstemp(prefix='.cc-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as file:
+            file.write(value)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--version', action='version', version='cc-switcher '+VERSION)
+    sub = parser.add_subparsers(dest='command')
+    sub.add_parser('menu')
+    login = sub.add_parser('login', help='create a separate claude.ai login')
+    login.add_argument('label')
+    switch = sub.add_parser('switch', help='select the profile used by run')
+    switch.add_argument('id')
+    sub.add_parser('list')
+    sub.add_parser('status')
+    delete = sub.add_parser('delete', help='move an inactive profile to private backups')
+    delete.add_argument('id')
+    run = sub.add_parser('run', help='launch Claude with the selected profile')
+    run.add_argument('args', nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    if args.command in (None, 'menu'):
+        if not shutil.which('gum'):
+            raise ValueError('menu requires Gum; scripted commands do not')
+        result = subprocess.run(['gum', 'choose', 'run', 'switch', 'login', 'list', 'status', 'delete', 'Quit'], capture_output=True, text=True)
+        choice = result.stdout.strip()
+        if result.returncode or choice in ('', 'Quit'):
+            return 0
+        extra = []
+        if choice in ('switch', 'delete', 'login'):
+            result = subprocess.run(['gum', 'input', '--header', 'Profile label' if choice == 'login' else 'Profile ID'], capture_output=True, text=True)
+            if result.returncode or not result.stdout.strip():
+                return 0
+            extra = [result.stdout.strip()]
+            if choice == 'delete' and subprocess.call(['gum', 'confirm', 'Move profile to backups?']):
+                return 0
+        return main([choice, *extra])
+    store = private(os.environ.get('CC_SWITCHER_DIR', str(Path.home()/'.cc-switcher')))
+    accounts = private(store/'accounts')
+    backups = private(store/'backups')
+    lockpath = checked(store/'.lock')
+    with lockpath.open('a') as lock:
+        os.chmod(lockpath, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current_file = checked(store/'selected')
+        current = ident(current_file.read_text().strip()) if current_file.exists() else None
+
+        def profile(name):
+            path = checked(accounts/ident(name))
+            marker = checked(path/'label')
+            if not path.is_dir() or not marker.is_file():
+                raise ValueError('profile does not exist or login is incomplete')
+            checked(path/'config')
+            return path
+
+        def command_env(path):
+            env = os.environ.copy()
+            env['CLAUDE_CONFIG_DIR'] = str(path/'config')
+            return env
+
+        if args.command == 'login':
+            name = label_id(args.label)
+            path = checked(accounts/name)
+            if path.exists():
+                raise ValueError('profile already exists; choose a different label')
+            if not shutil.which('claude'):
+                raise ValueError('install Claude Code first')
+            # Keep this directory stable: macOS keychain identity can depend on its path.
+            private(path)
+            private(path/'config')
+            atomic(path/'pending', 'login in progress\n')
+            # Release the global lock while the browser is open. The pending directory
+            # reserves the name, and cannot be selected, deleted or launched.
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            try:
+                result = subprocess.call(['claude', 'auth', 'login', '--claudeai'], env=command_env(path))
+                if result:
+                    return result
+                result = subprocess.run(['claude', 'auth', 'status', '--json'], env=command_env(path), capture_output=True, text=True)
+                try:
+                    status = json.loads(result.stdout)
+                except ValueError:
+                    raise ValueError('Claude did not return a valid authentication status') from None
+                if result.returncode or status.get('loggedIn') is not True:
+                    raise ValueError('Claude did not confirm a successful login')
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                atomic(path/'label', args.label+'\n')
+                (path/'pending').unlink()
+                print('Saved: '+name+'. Select with cc-switcher switch '+name)
+            finally:
+                if not (path/'label').exists():
+                    # Retain failed login data privately for inspection; no recursive deletion.
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    path.rename(backups/('failed.'+name+'.'+uuid.uuid4().hex))
+        elif args.command == 'switch':
+            profile(args.id)
+            atomic(current_file, args.id+'\n')
+            print('Selected: '+args.id+'. Launch with cc-switcher run')
+        elif args.command in ('list', 'status'):
+            if args.command == 'status':
+                print('Selected: '+(current or '(none)'))
+                print('Store: '+str(store))
+            print('Active\tName\tID')
+            for path in sorted(accounts.iterdir()):
+                if path.is_symlink():
+                    raise ValueError('symlink paths are not supported')
+                if path.is_dir() and checked(path/'label').is_file():
+                    profile(path.name)
+                    print(('yes' if current == path.name else '')+'\t'+(path/'label').read_text().strip()+'\t'+path.name)
+        elif args.command == 'delete':
+            path = profile(args.id)
+            if current == args.id:
+                raise ValueError('select another profile before deleting this one')
+            with checked(path/'.run-lock').open('a') as running:
+                try:
+                    fcntl.flock(running, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise ValueError('profile is running') from None
+                path.rename(backups/('deleted.'+args.id+'.'+uuid.uuid4().hex))
+            print('Moved to private backups: '+args.id)
+        elif args.command == 'run':
+            if current is None:
+                raise ValueError('select a profile first with cc-switcher switch ID')
+            path = profile(current)
+            extra = args.args[1:] if args.args[:1] == ['--'] else args.args
+            with checked(path/'.run-lock').open('a') as running:
+                fcntl.flock(running, fcntl.LOCK_SH)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                for key in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_PROFILE', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY'):
+                    if os.environ.get(key):
+                        print('cc-switcher: '+key+' is set and may override the selected login', file=sys.stderr)
+                return subprocess.call(['claude', *extra], env=command_env(path))
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (ValueError, OSError) as error:
+        print('cc-switcher: '+str(error), file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
