@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Named Claude Code configuration directories. Credentials stay managed by Claude."""
+"""Save and switch the login used by your existing Claude Code installation."""
 import argparse
 import contextlib
 import fcntl
+import getpass
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import uuid
 
-VERSION = '0.1.0'
+VERSION = '0.2.0'
 os.umask(0o077)
 
 
@@ -27,8 +31,8 @@ def checked(path):
 def private(path):
     path = checked(path)
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if path.stat().st_uid != os.getuid():
-        raise ValueError('profile directories must belong to the current user')
+    if not path.is_dir() or path.stat().st_uid != os.getuid():
+        raise ValueError('directory must belong to the current user')
     path.chmod(0o700)
     return path
 
@@ -45,8 +49,29 @@ def label_id(label):
     return ident(re.sub(r'[^a-z0-9._-]+', '-', label.lower()).strip('-'))
 
 
+def read(path, default=None):
+    path = checked(path)
+    if not path.exists():
+        if default is not None:
+            return default
+        raise ValueError('credential or profile file is missing')
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_size > 16*1024*1024:
+        raise ValueError('expected a regular JSON file smaller than 16 MiB')
+    try:
+        value = json.loads(path.read_bytes())
+    except (ValueError, UnicodeError):
+        raise ValueError('invalid JSON file') from None
+    if not isinstance(value, dict):
+        raise ValueError('expected a JSON object')
+    return value
+
+
 def atomic(path, value):
     path = checked(path)
+    # Do not change permissions on existing Claude configuration directories.
+    if not path.parent.exists():
+        private(path.parent)
     fd, tmp = tempfile.mkstemp(prefix='.cc-', dir=path.parent)
     try:
         with os.fdopen(fd, 'w') as file:
@@ -59,133 +84,218 @@ def atomic(path, value):
             os.unlink(tmp)
 
 
+def write_json(path, obj):
+    atomic(path, json.dumps(obj, ensure_ascii=True, indent=2)+'\n')
+
+
+def validate(snapshot):
+    oauth = snapshot.get('claudeAiOauth')
+    if not isinstance(oauth, dict) or not isinstance(oauth.get('accessToken'), str) or not oauth['accessToken']:
+        raise ValueError('no Claude subscription OAuth access token found')
+    account = snapshot.get('oauthAccount')
+    if account is not None and not isinstance(account, dict):
+        raise ValueError('invalid OAuth account metadata')
+    return snapshot
+
+
+class Active:
+    def __init__(self):
+        configured = os.environ.get('CLAUDE_CONFIG_DIR')
+        self.directory = checked(configured or Path.home()/'.claude')
+        secure = os.environ.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')
+        storage = checked((secure or Path.home()/'.claude') if secure is not None else self.directory)
+        self.credentials = checked(storage/'.credentials.json')
+        default_config = (self.directory if configured else Path.home())/'.claude.json'
+        legacy = checked(self.directory/'.config.json')
+        self.config = checked(legacy if legacy.exists() and legacy.stat().st_size else default_config)
+        self.service = 'Claude Code-credentials'
+        custom_storage = secure if secure is not None else configured
+        if custom_storage:
+            suffix = unicodedata.normalize('NFC', str(storage))
+            self.service += '-'+hashlib.sha256(suffix.encode()).hexdigest()[:8]
+        self.user = os.environ.get('USER') or getpass.getuser()
+        if not re.fullmatch(r'[a-zA-Z0-9._-]+', self.user):
+            self.user = 'claude-code-user'
+
+    def credentials_read(self):
+        if sys.platform != 'darwin':
+            return read(self.credentials, {})
+        result = subprocess.run(['security', 'find-generic-password', '-a', self.user, '-s', self.service, '-w'], capture_output=True, text=True)
+        if result.returncode == 44:
+            return read(self.credentials, {})
+        if result.returncode:
+            raise ValueError('cannot read Claude Keychain credentials; unlock the login Keychain')
+        try:
+            value = json.loads(result.stdout)
+        except ValueError:
+            raise ValueError('invalid Claude Keychain JSON') from None
+        if not isinstance(value, dict):
+            raise ValueError('invalid Claude Keychain document')
+        return value
+
+    def credentials_write(self, value):
+        if sys.platform != 'darwin':
+            write_json(self.credentials, value)
+            return
+        # security -i takes the secret through stdin, not process arguments.
+        payload = json.dumps(value, ensure_ascii=True).encode().hex()
+        command = f'add-generic-password -U -a "{self.user}" -s "{self.service}" -X "{payload}"\n'
+        result = subprocess.run(['security', '-i'], input=command, capture_output=True, text=True)
+        if result.returncode:
+            raise ValueError('cannot update Claude Keychain credentials')
+
+    def snapshot(self):
+        credentials = self.credentials_read()
+        config = read(self.config, {})
+        return validate({'claudeAiOauth': credentials.get('claudeAiOauth'), 'oauthAccount': config.get('oauthAccount')})
+
+    def activate(self, snapshot, backups):
+        validate(snapshot)
+        # Read/validate everything and retain originals before changing either file.
+        credentials = self.credentials_read()
+        config = read(self.config, {})
+        existed = self.config.exists()
+        original_config = self.config.read_bytes() if existed else None
+        write_json(backups/('active.'+uuid.uuid4().hex+'.json'), {'credentials': credentials, 'config': config})
+        new_credentials = {**credentials, 'claudeAiOauth': snapshot['claudeAiOauth']}
+        new_config = dict(config)
+        new_config.pop('oauthAccount', None)
+        if snapshot.get('oauthAccount') is not None:
+            new_config['oauthAccount'] = snapshot['oauthAccount']
+        # Preserve all settings, MCP tokens, project trust and session data.
+        try:
+            write_json(self.config, new_config)
+            self.credentials_write(new_credentials)
+        except BaseException:
+            if existed:
+                atomic(self.config, original_config.decode('utf-8'))
+            else:
+                with contextlib.suppress(FileNotFoundError):
+                    self.config.unlink()
+            raise
+
+
+def menu():
+    if not shutil.which('gum'):
+        raise ValueError('interactive pickers require Gum')
+    result = subprocess.run(['gum', 'choose', 'switch', 'save', 'login', 'list', 'status', 'delete', 'Quit'], capture_output=True, text=True)
+    choice = result.stdout.strip()
+    return None if result.returncode or choice in ('', 'Quit') else choice
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--version', action='version', version='cc-switcher '+VERSION)
     sub = parser.add_subparsers(dest='command')
     sub.add_parser('menu')
-    login = sub.add_parser('login', help='create a separate claude.ai login')
-    login.add_argument('label')
-    switch = sub.add_parser('switch', help='select the profile used by run')
-    switch.add_argument('id')
+    for action in ('save', 'login', 'switch', 'delete'):
+        part = sub.add_parser(action)
+        part.add_argument('value', nargs='?')
+        if action == 'save':
+            part.add_argument('--replace', action='store_true')
     sub.add_parser('list')
     sub.add_parser('status')
-    delete = sub.add_parser('delete', help='move an inactive profile to private backups')
-    delete.add_argument('id')
-    run = sub.add_parser('run', help='launch Claude with the selected profile')
-    run.add_argument('args', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if args.command in (None, 'menu'):
-        if not shutil.which('gum'):
-            raise ValueError('menu requires Gum; scripted commands do not')
-        result = subprocess.run(['gum', 'choose', 'run', 'switch', 'login', 'list', 'status', 'delete', 'Quit'], capture_output=True, text=True)
-        choice = result.stdout.strip()
-        if result.returncode or choice in ('', 'Quit'):
-            return 0
-        extra = []
-        if choice in ('switch', 'delete', 'login'):
-            result = subprocess.run(['gum', 'input', '--header', 'Profile label' if choice == 'login' else 'Profile ID'], capture_output=True, text=True)
-            if result.returncode or not result.stdout.strip():
-                return 0
-            extra = [result.stdout.strip()]
-            if choice == 'delete' and subprocess.call(['gum', 'confirm', 'Move profile to backups?']):
-                return 0
-        return main([choice, *extra])
+        choice = menu()
+        return main([choice]) if choice else 0
     store = private(os.environ.get('CC_SWITCHER_DIR', str(Path.home()/'.cc-switcher')))
-    accounts = private(store/'accounts')
-    backups = private(store/'backups')
-    lockpath = checked(store/'.lock')
-    with lockpath.open('a') as lock:
-        os.chmod(lockpath, 0o600)
+    accounts, backups = private(store/'accounts'), private(store/'backups')
+    with checked(store/'.lock').open('a') as lock:
+        os.chmod(store/'.lock', 0o600)
         fcntl.flock(lock, fcntl.LOCK_EX)
-        current_file = checked(store/'selected')
-        current = ident(current_file.read_text().strip()) if current_file.exists() else None
+        active = Active()
 
         def profile(name):
             path = checked(accounts/ident(name))
-            marker = checked(path/'label')
-            if not path.is_dir() or not marker.is_file():
-                raise ValueError('profile does not exist or login is incomplete')
-            checked(path/'config')
+            if not path.is_dir() or not checked(path/'label').is_file():
+                raise ValueError('profile does not exist')
             return path
 
-        def command_env(path):
-            env = os.environ.copy()
-            env['CLAUDE_CONFIG_DIR'] = str(path/'config')
-            return env
+        def saved(path):
+            snapshot = checked(path/'auth.json')
+            if snapshot.exists():
+                return validate(read(snapshot))
+            # Read 0.1.0 profiles without moving or deleting their credentials.
+            credentials = read(path/'config/.credentials.json')
+            config = read(path/'config/.claude.json', {})
+            return validate({'claudeAiOauth': credentials.get('claudeAiOauth'), 'oauthAccount': config.get('oauthAccount')})
 
-        if args.command == 'login':
-            name = label_id(args.label)
+        def save(label, snapshot, replace=False):
+            name = label_id(label)
             path = checked(accounts/name)
+            validate(snapshot)
             if path.exists():
-                raise ValueError('profile already exists; choose a different label')
+                if not replace:
+                    raise ValueError('profile exists; use save LABEL --replace')
+                write_json(backups/('replaced.'+name+'.'+uuid.uuid4().hex+'.json'), saved(profile(name)))
+            private(path)
+            write_json(path/'auth.json', snapshot)
+            atomic(path/'label', label+'\n')
+            print('Saved: '+name)
+
+        if args.command in ('save', 'login', 'switch', 'delete') and not args.value:
+            if not shutil.which('gum'):
+                raise ValueError('supply a label/ID, or install Gum for interactive pickers')
+            if args.command in ('switch', 'delete'):
+                names = sorted(p.name for p in accounts.iterdir() if not p.is_symlink() and p.is_dir() and checked(p/'label').is_file())
+                if not names:
+                    raise ValueError('no saved profiles')
+                result = subprocess.run(['gum', 'choose', *names], capture_output=True, text=True)
+            else:
+                result = subprocess.run(['gum', 'input', '--header', 'Account label'], capture_output=True, text=True)
+            if result.returncode or not result.stdout.strip():
+                return 0
+            args.value = result.stdout.strip()
+            if args.command == 'delete' and subprocess.call(['gum', 'confirm', 'Move account to backups?']):
+                return 0
+        if args.command == 'save':
+            label_id(args.value)
+            save(args.value, active.snapshot(), args.replace)
+        elif args.command == 'switch':
+            snapshot = saved(profile(args.value))
+            active.activate(snapshot, backups)
+            print('Switched: '+args.value+'. Restart Claude Code, then use claude normally.')
+        elif args.command == 'login':
+            name = label_id(args.value)
+            if checked(accounts/name).exists():
+                raise ValueError('profile already exists; login never replaces profiles')
             if not shutil.which('claude'):
                 raise ValueError('install Claude Code first')
-            # Keep this directory stable: macOS keychain identity can depend on its path.
-            private(path)
-            private(path/'config')
-            atomic(path/'pending', 'login in progress\n')
-            # Release the global lock while the browser is open. The pending directory
-            # reserves the name, and cannot be selected, deleted or launched.
-            fcntl.flock(lock, fcntl.LOCK_UN)
-            try:
-                result = subprocess.call(['claude', 'auth', 'login', '--claudeai'], env=command_env(path))
+            if sys.platform == 'darwin':
+                raise ValueError('isolated login capture currently requires file credentials on Linux; on macOS use claude auth login, then cc-switcher save LABEL')
+            with tempfile.TemporaryDirectory(prefix='login.', dir=store) as temp:
+                env = dict(os.environ)
+                env['CLAUDE_CONFIG_DIR'] = temp
+                env['CLAUDE_SECURESTORAGE_CONFIG_DIR'] = temp
+                for key in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_PROFILE', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY'):
+                    env.pop(key, None)
+                result = subprocess.call(['claude', 'auth', 'login', '--claudeai'], env=env)
                 if result:
                     return result
-                result = subprocess.run(['claude', 'auth', 'status', '--json'], env=command_env(path), capture_output=True, text=True)
-                try:
-                    status = json.loads(result.stdout)
-                except ValueError:
-                    raise ValueError('Claude did not return a valid authentication status') from None
-                if result.returncode or status.get('loggedIn') is not True:
-                    raise ValueError('Claude did not confirm a successful login')
-                fcntl.flock(lock, fcntl.LOCK_EX)
-                atomic(path/'label', args.label+'\n')
-                (path/'pending').unlink()
-                print('Saved: '+name+'. Select with cc-switcher switch '+name)
-            finally:
-                if not (path/'label').exists():
-                    # Retain failed login data privately for inspection; no recursive deletion.
-                    fcntl.flock(lock, fcntl.LOCK_EX)
-                    path.rename(backups/('failed.'+name+'.'+uuid.uuid4().hex))
-        elif args.command == 'switch':
-            profile(args.id)
-            atomic(current_file, args.id+'\n')
-            print('Selected: '+args.id+'. Launch with cc-switcher run')
+                credentials = read(Path(temp)/'.credentials.json')
+                config = read(Path(temp)/'.claude.json', {})
+                save(args.value, {'claudeAiOauth': credentials.get('claudeAiOauth'), 'oauthAccount': config.get('oauthAccount')})
+            print('New login saved. Use switch to activate it.')
+        elif args.command == 'delete':
+            path = profile(args.value)
+            path.rename(backups/('deleted.'+args.value+'.'+uuid.uuid4().hex))
+            print('Moved to backups: '+args.value)
         elif args.command in ('list', 'status'):
+            credentials = active.credentials_read()
+            current = credentials.get('claudeAiOauth')
             if args.command == 'status':
-                print('Selected: '+(current or '(none)'))
-                print('Store: '+str(store))
+                print('Credentials: '+(active.service if sys.platform == 'darwin' else str(active.credentials)))
+                print('Config: '+str(active.config)+'\nStore: '+str(store))
             print('Active\tName\tID')
             for path in sorted(accounts.iterdir()):
-                if path.is_symlink():
-                    raise ValueError('symlink paths are not supported')
+                checked(path)
                 if path.is_dir() and checked(path/'label').is_file():
-                    profile(path.name)
-                    print(('yes' if current == path.name else '')+'\t'+(path/'label').read_text().strip()+'\t'+path.name)
-        elif args.command == 'delete':
-            path = profile(args.id)
-            if current == args.id:
-                raise ValueError('select another profile before deleting this one')
-            with checked(path/'.run-lock').open('a') as running:
-                try:
-                    fcntl.flock(running, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    raise ValueError('profile is running') from None
-                path.rename(backups/('deleted.'+args.id+'.'+uuid.uuid4().hex))
-            print('Moved to private backups: '+args.id)
-        elif args.command == 'run':
-            if current is None:
-                raise ValueError('select a profile first with cc-switcher switch ID')
-            path = profile(current)
-            extra = args.args[1:] if args.args[:1] == ['--'] else args.args
-            with checked(path/'.run-lock').open('a') as running:
-                fcntl.flock(running, fcntl.LOCK_SH)
-                fcntl.flock(lock, fcntl.LOCK_UN)
-                for key in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_PROFILE', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY'):
-                    if os.environ.get(key):
-                        print('cc-switcher: '+key+' is set and may override the selected login', file=sys.stderr)
-                return subprocess.call(['claude', *extra], env=command_env(path))
+                    label = (path/'label').read_text().strip()
+                    if any(ord(c)<32 or ord(c)==127 for c in label):
+                        raise ValueError('invalid profile label')
+                    match = current is not None and saved(path)['claudeAiOauth'] == current
+                    print(('yes' if match else '')+'\t'+label+'\t'+ident(path.name))
     return 0
 
 
